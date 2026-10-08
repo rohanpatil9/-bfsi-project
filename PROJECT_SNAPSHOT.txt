@@ -1,0 +1,2163 @@
+============================================================
+SEC FINANCIAL ANALYST COPILOT - PROJECT SNAPSHOT
+Generated: 10/08/2026 13:52:17
+Root: C:\Users\ROHAN\Desktop\sec_financial_analyst_copilot
+============================================================
+
+==================== PROJECT STRUCTURE ====================
+artifacts\chunks.jsonl                                                                3443839 bytes
+artifacts\facts.jsonl                                                                  141717 bytes
+backend\.env                                                                              297 bytes
+backend\.env.example                                                                      237 bytes
+backend\app.py                                                                          27836 bytes
+backend\artifacts\facts_v2.jsonl                                                         6574 bytes
+backend\Dockerfile                                                                        180 bytes
+backend\extract_xbrl_facts.py                                                           19483 bytes
+backend\requirements.txt                                                                  168 bytes
+backend\sql\financial_facts_final.sql                                                     447 bytes
+backend\sql\financial_facts_v2.sql                                                        446 bytes
+backend\sql\schema.sql                                                                    936 bytes
+check_fact_schema.sql                                                                     184 bytes
+check_facts_v2.sql                                                                        268 bytes
+data\alphabet\metadata.json                                                              1337 bytes
+data\amazon\metadata.json                                                                1335 bytes
+data\meta\metadata.json                                                                  1333 bytes
+data\nvidia\metadata.json                                                                1335 bytes
+frontend\index.html                                                                        73 bytes
+frontend\package.json                                                                     304 bytes
+frontend\src\main.jsx                                                                    2196 bytes
+frontend\src\style.css                                                                   1807 bytes
+PROJECT_SNAPSHOT.txt                                                                      329 bytes
+README.md                                                                                1750 bytes
+test_embedding.py                                                                         952 bytes
+test_vertex.py                                                                            565 bytes
+tests\test_calculator.py                                                                  235 bytes
+
+==================== PYTHON FILES ========================
+
+############################################################
+FILE: test_embedding.py
+############################################################
+import os
+
+from dotenv import load_dotenv
+from google import genai
+from google.genai.types import EmbedContentConfig
+
+load_dotenv("backend/.env")
+
+project = os.getenv("GOOGLE_CLOUD_PROJECT")
+location = os.getenv("GOOGLE_CLOUD_LOCATION")
+model = os.getenv("EMBEDDING_MODEL")
+dimension = int(os.getenv("EMBEDDING_DIM"))
+
+print("Project:", project)
+print("Location:", location)
+print("Embedding model:", model)
+print("Requested dimension:", dimension)
+
+client = genai.Client(
+    vertexai=True,
+    project=project,
+    location=location,
+)
+
+response = client.models.embed_content(
+    model=model,
+    contents="Alphabet revenue increased during the quarter.",
+    config=EmbedContentConfig(
+        task_type="RETRIEVAL_DOCUMENT",
+        output_dimensionality=dimension,
+    ),
+)
+
+embedding = response.embeddings[0].values
+
+print("Actual embedding dimension:", len(embedding))
+print("First 5 values:", embedding[:5])
+
+############################################################
+FILE: test_vertex.py
+############################################################
+import os
+
+from dotenv import load_dotenv
+from google import genai
+
+load_dotenv("backend/.env")
+
+project = os.getenv("GOOGLE_CLOUD_PROJECT")
+location = os.getenv("GOOGLE_CLOUD_LOCATION")
+model = os.getenv("GEMINI_MODEL")
+
+print("Project:", project)
+print("Location:", location)
+print("Model:", model)
+
+client = genai.Client(
+    vertexai=True,
+    project=project,
+    location=location,
+)
+
+response = client.models.generate_content(
+    model=model,
+    contents="Reply with exactly: Gemini connection successful",
+)
+
+print(response.text)
+
+############################################################
+FILE: backend\app.py
+############################################################
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import fitz
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+from google.cloud import bigquery
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ENV_FILE = ROOT / "backend" / ".env"
+load_dotenv(ENV_FILE)
+
+PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+
+DATASET = os.getenv("BQ_DATASET", "sec_analyst")
+CHUNKS = os.getenv("BQ_CHUNKS_TABLE", "chunks")
+FACTS_V2 = os.getenv("BQ_FACTS_V2_TABLE", "financial_facts_v2")
+
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+EMBED_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
+TOP_K = int(os.getenv("TOP_K", "8"))
+
+FACT_INSERT_BATCH = 100
+CHUNK_INSERT_BATCH = 50
+EMBED_BATCH = 32
+
+
+COMPANIES = {
+    "amazon": (2025, {
+        "Q1": "2025-03-31", "Q2": "2025-06-30", "Q3": "2025-09-30"
+    }),
+    "alphabet": (2025, {
+        "Q1": "2025-03-31", "Q2": "2025-06-30", "Q3": "2025-09-30"
+    }),
+    "meta": (2025, {
+        "Q1": "2025-03-31", "Q2": "2025-06-30", "Q3": "2025-09-30"
+    }),
+    "nvidia": (2026, {
+        "Q1": "2025-04-27", "Q2": "2025-07-27", "Q3": "2025-10-26"
+    }),
+}
+
+ALIASES = {
+    "revenue": ["revenues", "revenue", "total revenues", "total revenue"],
+    "research_and_development": [
+        "research and development", "research & development", "r&d"
+    ],
+    "operating_income": ["income from operations", "operating income"],
+    "net_income": ["net income", "net earnings"],
+}
+
+
+def bq() -> bigquery.Client:
+    if not PROJECT:
+        raise RuntimeError("GOOGLE_CLOUD_PROJECT is missing. Check backend/.env.")
+    return bigquery.Client(project=PROJECT)
+
+
+def genai_client() -> genai.Client:
+    if not PROJECT:
+        raise RuntimeError("GOOGLE_CLOUD_PROJECT is missing. Check backend/.env.")
+    return genai.Client(vertexai=True, project=PROJECT, location=LOCATION)
+
+
+def norm(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").replace("\u00a0", " ")).strip()
+
+
+def sid(*values: Any) -> str:
+    return hashlib.sha1("|".join(map(str, values)).encode("utf-8")).hexdigest()
+
+
+def parse_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    s = norm(value)
+    if not s or s.upper() in {"-", "—", "–", "N/A", "NM"}:
+        return None
+
+    negative = s.startswith("(") and s.endswith(")")
+    s = (
+        s.replace(",", "")
+        .replace("$", "")
+        .replace("€", "")
+        .replace("£", "")
+        .replace("%", "")
+        .strip()
+        .strip("()")
+    )
+
+    try:
+        number = float(s)
+    except ValueError:
+        return None
+
+    return -number if negative else number
+
+
+def detect_unit(rows: list[list[str]]) -> str:
+    table_text = " ".join(
+        norm(cell) for row in rows for cell in row
+    ).lower()
+
+    if "in millions" in table_text:
+        return "USD millions"
+    if "in billions" in table_text:
+        return "USD billions"
+    if "%" in table_text:
+        return "percent"
+    return "unknown"
+
+
+def duration_from_text(text: str) -> int | None:
+    text = norm(text).lower()
+
+    if "three months ended" in text:
+        return 3
+    if "six months ended" in text:
+        return 6
+    if "nine months ended" in text:
+        return 9
+    if "twelve months ended" in text:
+        return 12
+
+    return None
+
+
+def period_label(year: int, fiscal_quarter: str, duration_months: int) -> str:
+    if duration_months == 3:
+        return f"{year}-{fiscal_quarter}"
+    if duration_months == 6:
+        return f"{year}-H1"
+    if duration_months == 9:
+        return f"{year}-9M"
+    if duration_months == 12:
+        return f"{year}-FY"
+    return f"{year}-{fiscal_quarter}-{duration_months}M"
+
+
+def detect_period_columns(
+    rows: list[list[str]],
+    fiscal_quarter: str,
+) -> dict[int, dict[str, Any]]:
+    """
+    Detect year/duration for each physical table column.
+
+    This intentionally uses the extracted table structure instead of
+    assuming that the final two numeric cells are the desired values.
+    """
+
+    result: dict[int, dict[str, Any]] = {}
+    current_duration: int | None = None
+
+    for row in rows:
+        row_text = " ".join(norm(x) for x in row if norm(x))
+        row_duration = duration_from_text(row_text)
+
+        if row_duration is not None:
+            current_duration = row_duration
+
+        for column_index, cell in enumerate(row):
+            cell_text = norm(cell)
+
+            if not re.fullmatch(r"20\d{2}", cell_text):
+                continue
+
+            # Conservative fallback for ordinary quarterly tables.
+            duration = current_duration or 3
+
+            result[column_index] = {
+                "year": int(cell_text),
+                "duration_months": duration,
+            }
+
+    return result
+
+
+def extract_period_values(
+    rows: list[list[str]],
+    row: list[str],
+    fiscal_quarter: str,
+) -> list[dict[str, Any]]:
+
+    period_columns = detect_period_columns(rows, fiscal_quarter)
+    output = []
+
+    for column_index, cell in enumerate(row):
+        if column_index == 0:
+            continue
+
+        value = parse_number(cell)
+        if value is None:
+            continue
+
+        header = period_columns.get(column_index)
+        if not header:
+            continue
+
+        output.append({
+            "period": period_label(
+                header["year"],
+                fiscal_quarter,
+                header["duration_months"],
+            ),
+            "value": value,
+            "duration_months": header["duration_months"],
+        })
+
+    return output
+
+
+def parse_file(path: Path) -> tuple[str, int, str]:
+    match = re.search(r"FY(\d+)_Q([123])_10Q", path.stem, re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Bad filename: {path}")
+
+    company = path.parent.name.lower()
+    if company not in COMPANIES:
+        raise ValueError(f"Unknown company directory: {company}")
+
+    return company, int(match.group(1)), f"Q{match.group(2)}"
+
+
+def detect_section(text: str) -> str | None:
+    patterns = [
+        r"ITEM\s+\d+[A-Z]?\s*\.?.{0,120}",
+        r"CONSOLIDATED STATEMENTS? OF [A-Z ]+",
+        r"NOTES TO CONSOLIDATED FINANCIAL STATEMENTS",
+        r"MANAGEMENT['’]S DISCUSSION AND ANALYSIS.{0,120}",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return norm(match.group(0))[:180]
+
+    return None
+
+
+def extract_tables(page: fitz.Page) -> list[tuple[int, list[list[str]]]]:
+    output = []
+
+    try:
+        for index, table in enumerate(page.find_tables().tables):
+            rows = table.extract()
+            clean_rows = [
+                [norm(cell) for cell in row]
+                for row in rows
+                if any(norm(cell) for cell in row)
+            ]
+            if clean_rows:
+                output.append((index, clean_rows))
+    except Exception:
+        pass
+
+    return output
+
+
+def extract_pdf(
+    pdf: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+
+    company, fiscal_year, fiscal_quarter = parse_file(pdf)
+    period_end = COMPANIES[company][1][fiscal_quarter]
+
+    document = fitz.open(pdf)
+    chunks = []
+    facts = []
+
+    for page_number, page in enumerate(document, start=1):
+        text = norm(page.get_text("text"))
+        section = detect_section(text)
+        parts = []
+
+        if text:
+            parts.append(("text", None, text))
+
+        for table_index, rows in extract_tables(page):
+            table_text = "\n".join(" | ".join(row) for row in rows)
+            table_name = f"table_{table_index}"
+            parts.append(("table", table_name, table_text))
+
+            unit = detect_unit(rows)
+
+            for row in rows:
+                if not row:
+                    continue
+
+                source_label = norm(row[0])
+                label_lower = source_label.lower()
+
+                metric = next(
+                    (
+                        name
+                        for name, aliases in ALIASES.items()
+                        if any(alias in label_lower for alias in aliases)
+                    ),
+                    None,
+                )
+
+                if not metric:
+                    continue
+
+                period_values = extract_period_values(
+                    rows,
+                    row,
+                    fiscal_quarter,
+                )
+
+                if not period_values:
+                    continue
+
+                facts.append({
+                    "company": company,
+                    "fiscal_year": fiscal_year,
+                    "fiscal_quarter": fiscal_quarter,
+                    "period_end": period_end,
+                    "metric": metric,
+                    "source_label": source_label,
+                    "unit": unit,
+                    "period_values": period_values,
+                    "pdf_page": page_number,
+                    "section": section,
+                    "table_index": table_index,
+                    "source_file": pdf.name,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+
+        for _, (chunk_type, table_name, content) in enumerate(parts):
+            if not content:
+                continue
+
+            if len(content) <= 6000 or chunk_type == "table":
+                pieces = [content]
+            else:
+                pieces = [
+                    content[i:i + 5500]
+                    for i in range(0, len(content), 5000)
+                ]
+
+            for piece_index, piece in enumerate(pieces):
+                chunks.append({
+                    "chunk_id": sid(
+                        company,
+                        fiscal_year,
+                        fiscal_quarter,
+                        page_number,
+                        chunk_type,
+                        table_name,
+                        piece_index,
+                    ),
+                    "company": company,
+                    "fiscal_year": fiscal_year,
+                    "fiscal_quarter": fiscal_quarter,
+                    "period_end": period_end,
+                    "pdf_page": page_number,
+                    "section": section,
+                    "table_name": table_name,
+                    "chunk_type": chunk_type,
+                    "source_file": pdf.name,
+                    "content": piece,
+                })
+
+    document.close()
+    return chunks, facts
+
+
+def ensure_facts_v2_table() -> None:
+    client = bq()
+    table_id = f"{PROJECT}.{DATASET}.{FACTS_V2}"
+
+    schema = [
+        bigquery.SchemaField("company", "STRING"),
+        bigquery.SchemaField("fiscal_year", "INT64"),
+        bigquery.SchemaField("fiscal_quarter", "STRING"),
+        bigquery.SchemaField("period_end", "DATE"),
+        bigquery.SchemaField("metric", "STRING"),
+        bigquery.SchemaField("source_label", "STRING"),
+        bigquery.SchemaField("unit", "STRING"),
+        bigquery.SchemaField(
+            "period_values",
+            "RECORD",
+            mode="REPEATED",
+            fields=[
+                bigquery.SchemaField("period", "STRING"),
+                bigquery.SchemaField("value", "FLOAT64"),
+                bigquery.SchemaField("duration_months", "INT64"),
+            ],
+        ),
+        bigquery.SchemaField("pdf_page", "INT64"),
+        bigquery.SchemaField("section", "STRING"),
+        bigquery.SchemaField("table_index", "INT64"),
+        bigquery.SchemaField("source_file", "STRING"),
+        bigquery.SchemaField("created_at", "TIMESTAMP"),
+    ]
+
+    client.create_table(
+        bigquery.Table(table_id, schema=schema),
+        exists_ok=True,
+    )
+
+
+def insert_rows_batched(
+    table_id: str,
+    rows: list[dict[str, Any]],
+    batch_size: int,
+) -> None:
+
+    client = bq()
+
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start:start + batch_size]
+        errors = client.insert_rows_json(table_id, batch)
+
+        if errors:
+            raise RuntimeError(
+                f"BigQuery insert failed for {table_id}: {errors}"
+            )
+
+
+def ingest_facts_v2() -> None:
+    """
+    Rebuild only financial_facts_v2.
+    Existing chunks and embeddings are untouched.
+    """
+
+    client = bq()
+    dataset_id = f"{PROJECT}.{DATASET}"
+
+    client.create_dataset(
+        bigquery.Dataset(dataset_id),
+        exists_ok=True,
+    )
+
+    ensure_facts_v2_table()
+
+    data = ROOT / "data"
+    if not data.exists():
+        data = ROOT.parent / "data"
+
+    pdfs = sorted(data.glob("*/*.pdf"))
+
+    if not pdfs:
+        raise RuntimeError("No PDFs found under data/<company>/*.pdf")
+
+    all_facts = []
+
+    for pdf in pdfs:
+        print(f"Parsing facts: {pdf}")
+        _, facts = extract_pdf(pdf)
+        all_facts.extend(facts)
+
+    table_id = f"{PROJECT}.{DATASET}.{FACTS_V2}"
+
+    client.query(f"TRUNCATE TABLE `{table_id}`").result()
+
+    insert_rows_batched(
+        table_id,
+        all_facts,
+        FACT_INSERT_BATCH,
+    )
+
+    artifact_dir = ROOT / "backend" / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    (artifact_dir / "facts_v2.jsonl").write_text(
+        "\n".join(
+            json.dumps(x, ensure_ascii=False)
+            for x in all_facts
+        ),
+        encoding="utf-8",
+    )
+
+    print("\nFACT V2 INGESTION COMPLETE")
+    print(f"PDFs: {len(pdfs)}")
+    print(f"Facts: {len(all_facts)}")
+    print(f"Table: {table_id}")
+
+
+def facts(
+    company: str,
+    fiscal_year: int,
+    fiscal_quarter: str,
+    metric: str,
+) -> list[dict[str, Any]]:
+
+    client = bq()
+
+    sql = f"""
+    SELECT *
+    FROM `{PROJECT}.{DATASET}.{FACTS_V2}`
+    WHERE LOWER(company) = @company
+      AND fiscal_year = @fiscal_year
+      AND UPPER(fiscal_quarter) = @fiscal_quarter
+      AND metric = @metric
+    ORDER BY pdf_page
+    """
+
+    params = [
+        bigquery.ScalarQueryParameter("company", "STRING", company.lower()),
+        bigquery.ScalarQueryParameter("fiscal_year", "INT64", fiscal_year),
+        bigquery.ScalarQueryParameter(
+            "fiscal_quarter", "STRING", fiscal_quarter.upper()
+        ),
+        bigquery.ScalarQueryParameter("metric", "STRING", metric),
+    ]
+
+    return [
+        dict(row)
+        for row in client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=params),
+        ).result()
+    ]
+
+
+def get_period_value(
+    fact: dict[str, Any],
+    period: str,
+    duration_months: int | None = None,
+) -> float | None:
+
+    for item in fact.get("period_values", []):
+        if item.get("period") != period:
+            continue
+
+        if (
+            duration_months is not None
+            and item.get("duration_months") != duration_months
+        ):
+            continue
+
+        if item.get("value") is not None:
+            return float(item["value"])
+
+    return None
+
+
+def find_fact_for_period(
+    fact_rows: list[dict[str, Any]],
+    period: str,
+    duration_months: int | None = None,
+) -> tuple[float | None, dict[str, Any] | None]:
+
+    for fact in fact_rows:
+        value = get_period_value(
+            fact,
+            period,
+            duration_months,
+        )
+
+        if value is not None:
+            return value, fact
+
+    return None, None
+
+
+def calculate_metric_yoy(
+    company: str,
+    fiscal_year: int,
+    fiscal_quarter: str,
+    metric: str,
+) -> dict[str, Any] | None:
+
+    current_period = f"{fiscal_year}-{fiscal_quarter}"
+    previous_period = f"{fiscal_year - 1}-{fiscal_quarter}"
+
+    rows = facts(
+        company,
+        fiscal_year,
+        fiscal_quarter,
+        metric,
+    )
+
+    current, current_fact = find_fact_for_period(
+        rows,
+        current_period,
+        3,
+    )
+
+    previous, previous_fact = find_fact_for_period(
+        rows,
+        previous_period,
+        3,
+    )
+
+    if current is None or previous is None:
+        return None
+
+    if previous == 0:
+        return None
+
+    growth = round(
+        ((current - previous) / previous) * 100,
+        2,
+    )
+
+    return {
+        "metric": metric,
+        "current_period": current_period,
+        "previous_period": previous_period,
+        "current_value": current,
+        "previous_value": previous,
+        "growth_percent": growth,
+        "unit": current_fact.get("unit") if current_fact else "unknown",
+        "current_source": current_fact,
+        "previous_source": previous_fact,
+        "formula": "(current - previous) / previous * 100",
+    }
+
+
+# The existing vector-search, intent, RAG-answer and FastAPI portions
+# can continue to use the same structure as your current application.
+# The important change is that all financial calculations now read
+# period_values from financial_facts_v2 instead of the unsafe values[].
+
+
+def embed(
+    texts: list[str],
+    task: str = "RETRIEVAL_DOCUMENT",
+) -> list[list[float]]:
+
+    client = genai_client()
+    output = []
+
+    for start in range(0, len(texts), EMBED_BATCH):
+        batch = texts[start:start + EMBED_BATCH]
+
+        response = client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=batch,
+            config=types.EmbedContentConfig(
+                task_type=task,
+                output_dimensionality=EMBED_DIM,
+                auto_truncate=True,
+            ),
+        )
+
+        output.extend(
+            [list(embedding.values) for embedding in response.embeddings]
+        )
+
+    return output
+
+
+def search(
+    question: str,
+    company: str | None = None,
+    fiscal_year: int | None = None,
+    fiscal_quarter: str | None = None,
+) -> list[dict[str, Any]]:
+
+    query_embedding = embed(
+        [question],
+        "RETRIEVAL_QUERY",
+    )[0]
+
+    client = bq()
+    where = []
+
+    params = [
+        bigquery.ArrayQueryParameter(
+            "embedding", "FLOAT64", query_embedding
+        ),
+        bigquery.ScalarQueryParameter(
+            "question", "STRING", question
+        ),
+        bigquery.ScalarQueryParameter(
+            "topk", "INT64", TOP_K
+        ),
+    ]
+
+    if company:
+        where.append("company = @company")
+        params.append(
+            bigquery.ScalarQueryParameter(
+                "company", "STRING", company.lower()
+            )
+        )
+
+    if fiscal_year:
+        where.append("fiscal_year = @fy")
+        params.append(
+            bigquery.ScalarQueryParameter(
+                "fy", "INT64", fiscal_year
+            )
+        )
+
+    if fiscal_quarter:
+        where.append("fiscal_quarter = @q")
+        params.append(
+            bigquery.ScalarQueryParameter(
+                "q", "STRING", fiscal_quarter.upper()
+            )
+        )
+
+    base = f"""
+        SELECT *
+        FROM `{PROJECT}.{DATASET}.{CHUNKS}`
+    """
+
+    if where:
+        base += " WHERE " + " AND ".join(where)
+
+    sql = f"""
+    SELECT
+        base.chunk_id,
+        base.company,
+        base.fiscal_year,
+        base.fiscal_quarter,
+        base.period_end,
+        base.pdf_page,
+        base.section,
+        base.table_name,
+        base.chunk_type,
+        base.source_file,
+        base.content,
+        distance
+    FROM VECTOR_SEARCH(
+        ({base}),
+        'embedding',
+        query_value => @embedding,
+        lexical_search_columns => ['content'],
+        lexical_search_query_value => @question,
+        top_k => @topk,
+        distance_type => 'COSINE'
+    )
+    ORDER BY distance
+    """
+
+    return [
+        dict(row)
+        for row in client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=params
+            ),
+        ).result()
+    ]
+
+
+INTENT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "mode": {
+            "type": "STRING",
+            "enum": [
+                "lookup",
+                "calculation",
+                "comparison",
+                "narrative",
+                "unknown",
+            ],
+        },
+        "company": {"type": "STRING"},
+        "fiscal_year": {"type": "INTEGER"},
+        "fiscal_quarter": {"type": "STRING"},
+        "metrics": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING",
+                "enum": [
+                    "revenue",
+                    "research_and_development",
+                    "operating_income",
+                    "net_income",
+                ],
+            },
+        },
+        "calculation": {
+            "type": "STRING",
+            "enum": [
+                "none",
+                "yoy_growth",
+                "qoq_growth",
+                "margin",
+                "absolute_change",
+                "compare_growth",
+            ],
+        },
+    },
+    "required": ["mode"],
+}
+
+
+def intent(question: str) -> dict[str, Any]:
+
+    client = genai_client()
+
+    prompt = f"""
+Classify this question about SEC 10-Q financial filings.
+
+Return only JSON matching the supplied schema.
+
+Rules:
+- Never invent a company, year or quarter.
+- metrics may contain more than one metric.
+- Use "comparison" when the user compares companies or metrics.
+- Use "calculation" when arithmetic is required.
+- Use "compare_growth" when comparing growth rates of two metrics.
+- Supported metrics:
+  revenue
+  research_and_development
+  operating_income
+  net_income
+
+Question:
+{question}
+"""
+
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+            response_schema=INTENT_SCHEMA,
+        ),
+    )
+
+    return json.loads(response.text)
+
+
+def calculate(
+    intent_result: dict[str, Any],
+) -> list[dict[str, Any]]:
+
+    company = intent_result.get("company")
+    fiscal_year = intent_result.get("fiscal_year")
+    fiscal_quarter = intent_result.get("fiscal_quarter")
+    metrics = intent_result.get("metrics") or []
+
+    if not all([company, fiscal_year, fiscal_quarter, metrics]):
+        return []
+
+    calculation_type = intent_result.get(
+        "calculation",
+        "none",
+    )
+
+    results = []
+
+    if calculation_type in {
+        "yoy_growth",
+        "compare_growth",
+    }:
+        for metric in metrics:
+            result = calculate_metric_yoy(
+                company,
+                int(fiscal_year),
+                fiscal_quarter,
+                metric,
+            )
+
+            if result:
+                results.append(result)
+
+    if (
+        calculation_type == "compare_growth"
+        and len(results) >= 2
+    ):
+        first = results[0]
+        second = results[1]
+
+        difference = round(
+            first["growth_percent"]
+            - second["growth_percent"],
+            2,
+        )
+
+        results.append({
+            "type": "growth_rate_comparison",
+            "metric_a": first["metric"],
+            "growth_a": first["growth_percent"],
+            "metric_b": second["metric"],
+            "growth_b": second["growth_percent"],
+            "difference_percentage_points": difference,
+            "formula": "growth_a - growth_b",
+        })
+
+    return results
+
+
+def answer(
+    question: str,
+    evidence: list[dict[str, Any]],
+    calculations: list[dict[str, Any]],
+) -> str:
+
+    client = genai_client()
+
+    evidence_blocks = []
+
+    for number, item in enumerate(evidence, start=1):
+        evidence_blocks.append(
+            f"""
+[S{number}]
+Company: {item["company"]}
+Fiscal year: {item["fiscal_year"]}
+Fiscal quarter: {item["fiscal_quarter"]}
+PDF page: {item["pdf_page"]}
+Section: {item.get("section")}
+Table: {item.get("table_name")}
+Source file: {item["source_file"]}
+
+{item["content"]}
+"""
+        )
+
+    prompt = f"""
+You are a financial analyst assistant.
+
+Answer the user's question using ONLY the supplied evidence.
+
+Rules:
+1. Never invent financial numbers.
+2. Deterministic calculations are authoritative.
+3. Do not perform arithmetic yourself when a calculation result is supplied.
+4. Every factual financial claim must be supported by evidence.
+5. Cite evidence inline using [S1], [S2], etc.
+6. If evidence is insufficient, say so.
+7. Do not cite a source that does not support the claim.
+8. Keep the answer concise but explain calculations when relevant.
+
+QUESTION:
+{question}
+
+DETERMINISTIC CALCULATIONS:
+{json.dumps(calculations, indent=2, default=str)}
+
+EVIDENCE:
+{"".join(evidence_blocks)}
+"""
+
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+        ),
+    )
+
+    return response.text.strip()
+
+
+class Query(BaseModel):
+    question: str = Field(min_length=3)
+    company: str | None = None
+    fiscal_year: int | None = None
+    fiscal_quarter: str | None = None
+
+
+app = FastAPI(
+    title="SEC Financial Analyst Copilot",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "project": PROJECT,
+        "dataset": DATASET,
+        "facts_table": FACTS_V2,
+        "model": MODEL,
+        "embedding_model": EMBED_MODEL,
+        "embedding_dimension": EMBED_DIM,
+    }
+
+
+@app.post("/api/query")
+def query(request: Query):
+
+    try:
+        intent_result = intent(request.question)
+
+        company = (
+            request.company
+            or intent_result.get("company")
+        )
+
+        fiscal_year = (
+            request.fiscal_year
+            or intent_result.get("fiscal_year")
+        )
+
+        fiscal_quarter = (
+            request.fiscal_quarter
+            or intent_result.get("fiscal_quarter")
+        )
+
+        evidence = search(
+            request.question,
+            company,
+            fiscal_year,
+            fiscal_quarter,
+        )
+
+        calculation_input = {
+            **intent_result,
+            "company": company,
+            "fiscal_year": fiscal_year,
+            "fiscal_quarter": fiscal_quarter,
+        }
+
+        calculations = calculate(calculation_input)
+
+        generated_answer = answer(
+            request.question,
+            evidence,
+            calculations,
+        )
+
+        citations = []
+        seen = set()
+
+        for item in evidence:
+            chunk_id = item["chunk_id"]
+
+            if chunk_id in seen:
+                continue
+
+            seen.add(chunk_id)
+
+            citations.append({
+                key: item.get(key)
+                for key in [
+                    "company",
+                    "fiscal_year",
+                    "fiscal_quarter",
+                    "pdf_page",
+                    "section",
+                    "table_name",
+                    "chunk_id",
+                    "source_file",
+                ]
+            })
+
+        return {
+            "answer": generated_answer,
+            "intent": intent_result,
+            "calculations": calculations,
+            "citations": citations,
+            "retrieved_chunks": len(evidence),
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
+
+
+if __name__ == "__main__":
+
+    command = (
+        sys.argv[1].lower()
+        if len(sys.argv) > 1
+        else "help"
+    )
+
+    if command == "ingest-facts":
+        ingest_facts_v2()
+
+    elif command == "help":
+        print("""
+SEC Financial Analyst Copilot
+
+Commands:
+
+  python backend/app.py ingest-facts
+      Rebuild only financial_facts_v2.
+
+  uvicorn backend.app:app --reload --port 8000
+      Start the API.
+""")
+
+    else:
+        print(f"Unknown command: {command}")
+
+
+############################################################
+FILE: backend\extract_xbrl_facts.py
+############################################################
+"""
+SEC XBRL financial fact extractor for the SEC Financial Analyst Copilot.
+
+Purpose
+-------
+Build a reliable, period-aware financial_facts_final table from SEC's
+Company Facts API instead of trying to infer financial values from PDF
+column positions.
+
+The PDF remains the evidence/citation source. SEC XBRL is the numerical
+source of truth for the structured financial facts.
+
+Usage
+-----
+1. Add to backend/.env:
+       SEC_USER_AGENT=Your Name your.email@example.com
+
+2. Create the table:
+       Get-Content .\backend\sql\financial_facts_final.sql -Raw |
+           bq query --use_legacy_sql=false
+
+3. Run:
+       python .\backend\extract_xbrl_facts.py
+
+The extractor automatically finds the 10-Q accession matching each target
+period from the SEC submissions API, then reads SEC Company Facts and keeps
+the 3-month quarterly facts for Q1/Q2/Q3. This avoids the Q2/Q3 6-month and
+9-month column ambiguity that affected the PDF extractor.
+
+SEC API documentation:
+https://www.sec.gov/search-filings/edgar-application-programming-interfaces
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
+from dotenv import load_dotenv
+from google.cloud import bigquery
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / "backend" / ".env")
+
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "bfsi-project-510910")
+DATASET = os.getenv("BQ_DATASET", "sec_analyst")
+TABLE = "financial_facts_final"
+
+SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "").strip()
+
+if not SEC_USER_AGENT:
+    raise RuntimeError(
+        "SEC_USER_AGENT is not configured. Add this to backend/.env:\n"
+        "SEC_USER_AGENT=Your Name your.email@example.com"
+    )
+
+COMPANIES: Dict[str, Dict[str, str]] = {
+    "amazon": {"cik": "0001018724"},
+    "alphabet": {"cik": "0001652044"},
+    "meta": {"cik": "0001326801"},
+    "nvidia": {"cik": "0001045810"},
+}
+
+# Fiscal quarter end dates used by the 12 PDFs already downloaded.
+# NVIDIA uses a non-calendar fiscal year.
+TARGET_FILINGS: Dict[str, List[Tuple[int, str, str]]] = {
+    "amazon": [
+        (2025, "Q1", "2025-03-31"),
+        (2025, "Q2", "2025-06-30"),
+        (2025, "Q3", "2025-09-30"),
+    ],
+    "alphabet": [
+        (2025, "Q1", "2025-03-31"),
+        (2025, "Q2", "2025-06-30"),
+        (2025, "Q3", "2025-09-30"),
+    ],
+    "meta": [
+        (2025, "Q1", "2025-03-31"),
+        (2025, "Q2", "2025-06-30"),
+        (2025, "Q3", "2025-09-30"),
+    ],
+    "nvidia": [
+        (2026, "Q1", "2025-04-27"),
+        (2026, "Q2", "2025-07-27"),
+        (2026, "Q3", "2025-10-26"),
+    ],
+}
+
+# Core metrics needed for the analyst-copilot use cases.
+# The aliases are standard us-gaap tags seen across issuers.
+METRIC_ALIASES: Dict[str, List[str]] = {
+    "revenue": [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+        "SalesRevenueGoodsNet",
+    ],
+    "research_and_development": [
+        "ResearchAndDevelopmentExpense",
+    ],
+    "operating_income": [
+        "OperatingIncomeLoss",
+    ],
+    "net_income": [
+        "NetIncomeLoss",
+        "ProfitLoss",
+    ],
+    "cost_of_revenue": [
+        "CostOfRevenue",
+        "CostOfGoodsAndServicesSold",
+    ],
+    "selling_general_and_administrative": [
+        "SellingGeneralAndAdministrativeExpense",
+    ],
+    "assets": [
+        "Assets",
+    ],
+    "liabilities": [
+        "Liabilities",
+    ],
+    "cash": [
+        "CashAndCashEquivalentsAtCarryingValue",
+    ],
+    "stockholders_equity": [
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# SEC HTTP client
+# ---------------------------------------------------------------------------
+
+class SECClient:
+    BASE = "https://data.sec.gov"
+    ARCHIVES = "https://www.sec.gov/Archives/edgar/data"
+
+    def __init__(self, user_agent: str):
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": user_agent,
+                "Accept-Encoding": "gzip, deflate",
+                "Host": "data.sec.gov",
+            }
+        )
+
+    def get_json(self, url: str) -> Dict[str, Any]:
+        # Be polite to SEC infrastructure.
+        time.sleep(0.25)
+
+        response = self.session.get(url, timeout=45)
+        response.raise_for_status()
+        return response.json()
+
+    def submissions(self, cik: str) -> Dict[str, Any]:
+        return self.get_json(
+            f"{self.BASE}/submissions/CIK{cik}.json"
+        )
+
+    def companyfacts(self, cik: str) -> Dict[str, Any]:
+        return self.get_json(
+            f"{self.BASE}/api/xbrl/companyfacts/CIK{cik}.json"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SEC filing discovery
+# ---------------------------------------------------------------------------
+
+def find_target_10q(
+    submissions: Dict[str, Any],
+    target_end: str,
+    fiscal_quarter: str,
+) -> Dict[str, str]:
+    """
+    Find the 10-Q whose reportDate equals the requested fiscal period end.
+
+    Returns:
+        accession, accession_no_dash, filing_date, report_date, primary_document
+    """
+    recent = submissions.get("filings", {}).get("recent", {})
+
+    fields = [
+        "form",
+        "filingDate",
+        "reportDate",
+        "accessionNumber",
+        "primaryDocument",
+        "primaryDocDescription",
+        "isXBRL",
+    ]
+
+    rows = []
+    for field in fields:
+        rows.append(recent.get(field, []))
+
+    if not rows or not rows[0]:
+        raise RuntimeError("SEC submissions response contains no recent filings.")
+
+    records = [
+        dict(zip(fields, values))
+        for values in zip(*rows)
+    ]
+
+    candidates = [
+        r
+        for r in records
+        if r["form"] == "10-Q"
+        and r["reportDate"] == target_end
+    ]
+
+    if not candidates:
+        # Some issuers may have a report-date representation that differs
+        # slightly. Give a useful diagnostic rather than silently selecting
+        # the wrong filing.
+        nearby = [
+            (
+                r["form"],
+                r["filingDate"],
+                r["reportDate"],
+                r["accessionNumber"],
+                r["primaryDocument"],
+            )
+            for r in records
+            if r["form"] == "10-Q"
+        ][:20]
+
+        raise RuntimeError(
+            f"Could not find a 10-Q for {fiscal_quarter} ending {target_end}. "
+            f"Recent 10-Qs seen: {nearby}"
+        )
+
+    # Prefer the XBRL filing if several candidates exist.
+    candidates.sort(
+        key=lambda r: (
+            str(r.get("isXBRL", "0")) == "1",
+            r["filingDate"],
+        ),
+        reverse=True,
+    )
+
+    selected = candidates[0]
+    accession = selected["accessionNumber"]
+    return {
+        "accession": accession,
+        "accession_no_dash": accession.replace("-", ""),
+        "filing_date": selected["filingDate"],
+        "report_date": selected["reportDate"],
+        "primary_document": selected["primaryDocument"],
+        "is_xbrl": str(selected.get("isXBRL", "")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# XBRL fact selection
+# ---------------------------------------------------------------------------
+
+def iso_days(start: str, end: str) -> int:
+    return (date.fromisoformat(end) - date.fromisoformat(start)).days
+
+
+def duration_months_from_days(days: int) -> Optional[int]:
+    """
+    SEC quarterly filings commonly use approximately:
+      3 months = ~80-110 days
+      6 months = ~170-200 days
+      9 months = ~260-290 days
+    """
+    if 80 <= days <= 110:
+        return 3
+    if 170 <= days <= 200:
+        return 6
+    if 260 <= days <= 290:
+        return 9
+    if 350 <= days <= 380:
+        return 12
+    return None
+
+
+def unit_to_display(unit: str, value: float) -> Tuple[str, float]:
+    """
+    Normalize USD values to USD millions because SEC financial statements
+    typically present these statements in millions.
+
+    Other units are retained as-is.
+    """
+    if unit == "USD":
+        return "USD millions", value / 1_000_000.0
+
+    if unit == "USD/shares":
+        return "USD/share", value
+
+    if unit == "shares":
+        return "shares", value
+
+    if unit == "pure":
+        return "pure", value
+
+    return unit, value
+
+
+def iter_concept_facts(
+    companyfacts: Dict[str, Any],
+    concept: str,
+) -> Iterable[Tuple[str, Dict[str, Any]]]:
+    """
+    Yield (unit, fact) for a us-gaap concept.
+    """
+    facts = companyfacts.get("facts", {})
+    us_gaap = facts.get("us-gaap", {})
+    concept_data = us_gaap.get(concept)
+
+    if not concept_data:
+        return
+
+    units = concept_data.get("units", {})
+    for unit_name, fact_rows in units.items():
+        for fact in fact_rows:
+            yield unit_name, fact
+
+
+def choose_facts(
+    companyfacts: Dict[str, Any],
+    metric: str,
+    target_end: str,
+    accession: str,
+    fiscal_year: int,
+    fiscal_quarter: str,
+) -> List[Dict[str, Any]]:
+    """
+    Return the current-quarter and prior-year-quarter XBRL facts for a metric.
+
+    Important:
+    - Q2 filings contain both 3-month and 6-month facts.
+    - Q3 filings contain both 3-month and 9-month facts.
+    - We keep ONLY ~3-month facts here.
+    - We select facts by the filing accession, so the current filing's
+      comparative prior-year values can also be captured.
+    """
+    target_date = date.fromisoformat(target_end)
+    concepts = METRIC_ALIASES[metric]
+
+    for concept in concepts:
+        candidates: List[Tuple[str, Dict[str, Any], int]] = []
+
+        for unit_name, fact in iter_concept_facts(companyfacts, concept):
+            if fact.get("form") != "10-Q":
+                continue
+
+            if fact.get("accn") != accession:
+                continue
+
+            fact_fp = str(fact.get("fp", "")).upper()
+            if fact_fp != fiscal_quarter:
+                continue
+
+            end = fact.get("end")
+            start = fact.get("start")
+
+            if not end:
+                continue
+
+            # Balance sheet facts are instantaneous.
+            if not start:
+                # Only use the current period-end for balance sheet metrics.
+                if end != target_end:
+                    continue
+
+                candidates.append((unit_name, fact, 0))
+                continue
+
+            try:
+                days = iso_days(start, end)
+            except Exception:
+                continue
+
+            # Keep quarterly duration only.
+            if duration_months_from_days(days) != 3:
+                continue
+
+            end_date = date.fromisoformat(end)
+            distance_from_current = abs((end_date - target_date).days)
+
+            # Keep the current quarter and the comparative prior-year quarter.
+            # A fiscal quarter can shift by a few days (notably NVIDIA).
+            if distance_from_current > 370:
+                continue
+
+            candidates.append((unit_name, fact, days))
+
+        if not candidates:
+            continue
+
+        # Prefer USD for monetary metrics.
+        candidates.sort(
+            key=lambda item: (
+                item[0] == "USD",
+                item[1].get("filed", ""),
+            ),
+            reverse=True,
+        )
+
+        # Deduplicate by end date. If multiple facts exist for the same
+        # end date, retain the first preferred unit/concept.
+        selected: List[Dict[str, Any]] = []
+        seen_ends = set()
+
+        for unit_name, fact, days in candidates:
+            end = fact["end"]
+            if end in seen_ends:
+                continue
+
+            seen_ends.add(end)
+            selected.append(
+                {
+                    "concept": concept,
+                    "unit_name": unit_name,
+                    "fact": fact,
+                    "duration_months": (
+                        3 if fact.get("start") else None
+                    ),
+                }
+            )
+
+        # We expect current + comparative for P&L metrics. Sort chronologically.
+        selected.sort(key=lambda item: item["fact"]["end"])
+
+        return selected
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+
+def period_label(
+    fiscal_year: int,
+    fiscal_quarter: str,
+) -> str:
+    return f"{fiscal_year}-{fiscal_quarter}"
+
+
+def prior_year_period(
+    fiscal_year: int,
+    fiscal_quarter: str,
+) -> str:
+    return f"{fiscal_year - 1}-{fiscal_quarter}"
+
+
+def make_rows(
+    company: str,
+    fiscal_year: int,
+    fiscal_quarter: str,
+    target_end: str,
+    metric: str,
+    selected_facts: List[Dict[str, Any]],
+    source_file: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    target_date = date.fromisoformat(target_end)
+
+    for selected in selected_facts:
+        fact = selected["fact"]
+        unit_name = selected["unit_name"]
+
+        raw_value = float(fact["val"])
+        display_unit, display_value = unit_to_display(unit_name, raw_value)
+
+        fact_end = date.fromisoformat(fact["end"])
+
+        if fact_end == target_date:
+            period = period_label(fiscal_year, fiscal_quarter)
+        else:
+            # The comparison fact belongs to the same fiscal quarter in the
+            # prior year. This also handles NVIDIA's shifted fiscal dates.
+            period = period_label(fiscal_year - 1, fiscal_quarter)
+
+        rows.append(
+            {
+                "company": company,
+                "fiscal_year": fiscal_year,
+                "fiscal_quarter": fiscal_quarter,
+                "period_end": fact["end"],
+                "metric": metric,
+                "source_label": metric.replace("_", " ").title(),
+                "period": period,
+                "duration_months": selected["duration_months"],
+                "value": display_value,
+                "unit": display_unit,
+                "pdf_page": None,
+                "section": None,
+                "table_name": None,
+                "source_file": source_file,
+                "validation_source": "SEC_XBRL",
+                "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+        )
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# BigQuery
+# ---------------------------------------------------------------------------
+
+def table_id() -> str:
+    return f"{PROJECT_ID}.{DATASET}.{TABLE}"
+
+
+def ensure_table(client: bigquery.Client) -> None:
+    sql = f"""
+    CREATE TABLE IF NOT EXISTS `{table_id()}`
+    (
+      company STRING,
+      fiscal_year INT64,
+      fiscal_quarter STRING,
+      period_end DATE,
+
+      metric STRING,
+      source_label STRING,
+
+      period STRING,
+      duration_months INT64,
+
+      value FLOAT64,
+      unit STRING,
+
+      pdf_page INT64,
+      section STRING,
+      table_name STRING,
+
+      source_file STRING,
+
+      validation_source STRING,
+
+      created_at TIMESTAMP
+    )
+    """
+    client.query(sql).result()
+
+
+def insert_rows(client: bigquery.Client, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+
+    errors = client.insert_rows_json(
+        table_id(),
+        rows,
+        skip_invalid_rows=False,
+        ignore_unknown_values=False,
+    )
+
+    if errors:
+        raise RuntimeError(f"BigQuery insert errors: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# Main extraction
+# ---------------------------------------------------------------------------
+
+def extract() -> None:
+    sec = SECClient(SEC_USER_AGENT)
+    bq = bigquery.Client(project=PROJECT_ID)
+
+    ensure_table(bq)
+
+    # We rebuild this final table on each explicit extraction run.
+    bq.query(f"TRUNCATE TABLE `{table_id()}`").result()
+
+    all_rows: List[Dict[str, Any]] = []
+    filing_count = 0
+
+    for company, config in COMPANIES.items():
+        cik = config["cik"]
+
+        print(f"\nLoading SEC submissions: {company}")
+        submissions = sec.submissions(cik)
+
+        print(f"Loading SEC Company Facts: {company}")
+        companyfacts = sec.companyfacts(cik)
+
+        for fiscal_year, fiscal_quarter, target_end in TARGET_FILINGS[company]:
+            filing = find_target_10q(
+                submissions,
+                target_end,
+                fiscal_quarter,
+            )
+
+            accession = filing["accession"]
+            source_file = (
+                f"FY{fiscal_year}_{fiscal_quarter}_10Q.pdf"
+            )
+
+            filing_count += 1
+
+            print(
+                f"  {company.upper()} {fiscal_quarter} "
+                f"FY{fiscal_year} | {target_end} | "
+                f"{accession}"
+            )
+
+            for metric in METRIC_ALIASES:
+                selected_facts = choose_facts(
+                    companyfacts=companyfacts,
+                    metric=metric,
+                    target_end=target_end,
+                    accession=accession,
+                    fiscal_year=fiscal_year,
+                    fiscal_quarter=fiscal_quarter,
+                )
+
+                if not selected_facts:
+                    print(f"      WARNING: no XBRL fact for {metric}")
+                    continue
+
+                rows = make_rows(
+                    company=company,
+                    fiscal_year=fiscal_year,
+                    fiscal_quarter=fiscal_quarter,
+                    target_end=target_end,
+                    metric=metric,
+                    selected_facts=selected_facts,
+                    source_file=source_file,
+                )
+
+                all_rows.extend(rows)
+
+                for row in rows:
+                    print(
+                        f"      {metric}: "
+                        f"{row['period']} = "
+                        f"{row['value']} {row['unit']} "
+                        f"({row['duration_months']} months)"
+                    )
+
+    insert_rows(bq, all_rows)
+
+    print("\n" + "=" * 70)
+    print("XBRL FINANCIAL FACT INGESTION COMPLETE")
+    print("=" * 70)
+    print(f"Filings processed : {filing_count}")
+    print(f"Facts inserted    : {len(all_rows)}")
+    print(f"BigQuery table    : {table_id()}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    try:
+        extract()
+    except Exception as exc:
+        print("\nXBRL EXTRACTION FAILED")
+        print(f"{type(exc).__name__}: {exc}")
+        sys.exit(1)
+
+
+############################################################
+FILE: tests\test_calculator.py
+############################################################
+def growth(old,new): return round((new-old)/old*100,2)
+def margin(n,d): return round(n/d*100,2)
+def test_alphabet(): assert growth(80539,90234)==12.04 and growth(11903,13556)==13.88
+def test_margin(): assert margin(30606,90234)==33.92
+
+
+==================== SQL FILES ===========================
+
+############################################################
+FILE: check_facts_v2.sql
+############################################################
+SELECT
+  company,
+  fiscal_year,
+  fiscal_quarter,
+  metric,
+  source_label,
+  unit,
+  period_values,
+  pdf_page,
+  section,
+  table_index,
+  source_file
+FROM `bfsi-project-510910.sec_analyst.financial_facts_v2`
+ORDER BY company, fiscal_year, fiscal_quarter, metric;
+
+
+############################################################
+FILE: check_fact_schema.sql
+############################################################
+SELECT
+  column_name,
+  data_type,
+  is_nullable
+FROM `bfsi-project-510910.sec_analyst.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'financial_facts'
+ORDER BY ordinal_position;
+
+############################################################
+FILE: backend\sql\financial_facts_final.sql
+############################################################
+CREATE TABLE IF NOT EXISTS
+`bfsi-project-510910.sec_analyst.financial_facts_final`
+(
+  company STRING,
+  fiscal_year INT64,
+  fiscal_quarter STRING,
+  period_end DATE,
+
+  metric STRING,
+  source_label STRING,
+
+  period STRING,
+  duration_months INT64,
+
+  value FLOAT64,
+  unit STRING,
+
+  pdf_page INT64,
+  section STRING,
+  table_name STRING,
+
+  source_file STRING,
+
+  validation_source STRING,
+
+  created_at TIMESTAMP
+);
+
+############################################################
+FILE: backend\sql\financial_facts_v2.sql
+############################################################
+CREATE TABLE IF NOT EXISTS
+`bfsi-project-510910.sec_analyst.financial_facts_v2`
+(
+  company STRING,
+  fiscal_year INT64,
+  fiscal_quarter STRING,
+  period_end DATE,
+  metric STRING,
+  source_label STRING,
+  unit STRING,
+  period_values ARRAY<STRUCT<
+    period STRING,
+    value FLOAT64,
+    duration_months INT64
+  >>,
+  pdf_page INT64,
+  section STRING,
+  table_index INT64,
+  source_file STRING,
+  created_at TIMESTAMP
+);
+
+
+############################################################
+FILE: backend\sql\schema.sql
+############################################################
+CREATE SCHEMA IF NOT EXISTS `bfsi-project-510910.sec_analyst` OPTIONS(location="US");
+CREATE TABLE IF NOT EXISTS `bfsi-project-510910.sec_analyst.chunks` (
+  chunk_id STRING NOT NULL,
+  company STRING,
+  fiscal_year INT64,
+  fiscal_quarter STRING,
+  period_end DATE,
+  pdf_page INT64,
+  section STRING,
+  table_name STRING,
+  chunk_type STRING,
+  source_file STRING,
+  content STRING,
+  embedding ARRAY<FLOAT64>
+);
+CREATE TABLE IF NOT EXISTS `bfsi-project-510910.sec_analyst.financial_facts` (
+  company STRING,
+  fiscal_year INT64,
+  fiscal_quarter STRING,
+  period_end DATE,
+  metric STRING,
+  source_label STRING,
+  values ARRAY<FLOAT64>,
+  pdf_page INT64,
+  section STRING,
+  table_index INT64,
+  source_file STRING
+);
+-- Run after ingestion:
+-- CREATE VECTOR INDEX chunks_embedding_idx
+-- ON `bfsi-project-510910.sec_analyst.chunks`(embedding)
+-- OPTIONS(index_type='IVF', distance_type='COSINE', ivf_options='{"num_lists":100}');
+
+
+==================== FRONTEND FILES ======================
+
+############################################################
+FILE: frontend\index.html
+############################################################
+<div id="root"></div><script type="module" src="/src/main.jsx"></script>
+
+
+############################################################
+FILE: frontend\package.json
+############################################################
+{"name":"sec-financial-copilot","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"vite","build":"vite build","preview":"vite preview"},"dependencies":{"lucide-react":"^0.468.0","react":"^18.3.1","react-dom":"^18.3.1"},"devDependencies":{"@vitejs/plugin-react":"^4.3.4","vite":"^6.3.5"}}
+
+
+############################################################
+FILE: frontend\src\main.jsx
+############################################################
+import React,{useState} from 'react';import{createRoot}from'react-dom/client';import'./style.css';
+const examples=["Did Alphabet's R&D grow faster than revenue in Q1 2025?","What was Alphabet's revenue in Q1 2025?","Compare Amazon, Alphabet and Meta revenue in Q1 2025.","What factors contributed to Alphabet's revenue growth?"];
+function App(){const[q,setQ]=useState('');const[r,setR]=useState(null);const[loading,setLoading]=useState(false);const[err,setErr]=useState('');async function ask(v=q){if(!v.trim())return;setQ(v);setLoading(true);setErr('');try{let x=await fetch('http://localhost:8000/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:v})});let d=await x.json();if(!x.ok)throw Error(d.detail||'Request failed');setR(d)}catch(e){setErr(e.message)}finally{setLoading(false)}}return <><header><b>SEC Financial Analyst Copilot</b><span>12 SEC 10-Q filings · 4 companies</span></header><main><div className="hero"><small>RAG + FINANCIAL REASONING</small><h1>Ask questions across the filings.</h1><p>Evidence-backed answers with deterministic financial calculations.</p></div><div className="box"><textarea value={q} onChange={e=>setQ(e.target.value)} placeholder="Did Alphabet's R&D grow faster than revenue in Q1 2025?"/><button onClick={()=>ask()} disabled={loading}>{loading?'Analyzing...':'Analyze'}</button></div><div className="examples">{examples.map(e=><button onClick={()=>ask(e)} key={e}>{e}</button>)}</div>{err&&<div className="error">{err}</div>}{r&&<><section><h3>Answer</h3><p className="answer">{r.answer}</p></section>{r.calculations?.length>0&&<section><h3>Deterministic calculations</h3><div className="grid">{r.calculations.map((c,i)=><div className="card" key={i}><b>{c.name}</b><strong>{c.result} {c.unit}</strong><small>{c.formula}</small></div>)}</div></section>}<section><h3>Sources</h3>{r.citations.map((c,i)=><div className="source" key={i}><b>{c.company.toUpperCase()} · FY{c.fiscal_year} {c.fiscal_quarter}</b><span>PDF page {c.pdf_page}{c.section?' · '+c.section:''}{c.table_name?' · '+c.table_name:''}</span></div>)}</section></>}</main></>};createRoot(document.getElementById('root')).render(<App/>);
+
+
+############################################################
+FILE: frontend\src\style.css
+############################################################
+*{box-sizing:border-box}body{margin:0;background:#080b11;color:#e8edf5;font-family:Inter,system-ui,sans-serif}header{height:64px;border-bottom:1px solid #222b38;display:flex;align-items:center;gap:14px;padding:0 5%;}header span{color:#7f8a9c;font-size:12px}main{max-width:1000px;margin:auto;padding:70px 24px}.hero{max-width:760px}.hero small{color:#849cff;letter-spacing:.15em;font-weight:700}.hero h1{font-size:48px;line-height:1.05;margin:14px 0}.hero p{color:#8994a7}.box{margin-top:34px;padding:12px;border:1px solid #293244;border-radius:16px;background:#0d121b;display:grid;grid-template-columns:1fr auto;gap:10px}.box textarea{min-height:90px;background:transparent;border:0;outline:0;color:white;padding:10px;resize:vertical}.box button{align-self:end;padding:12px 18px;border:0;border-radius:9px;font-weight:700;cursor:pointer}.examples{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 28px}.examples button{background:#0d121b;color:#9ba6b7;border:1px solid #252e3e;border-radius:20px;padding:8px 11px;font-size:12px}section{margin-top:14px;border:1px solid #242d3b;background:#0d121b;border-radius:14px;padding:18px}section h3{margin:0 0 14px;font-size:14px}.answer{white-space:pre-wrap;line-height:1.7;color:#d8dfeb}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{padding:15px;border:1px solid #252e3e;border-radius:10px;display:flex;flex-direction:column;gap:7px}.card strong{font-size:23px}.card small,.source span{color:#7f8a9c}.source{padding:12px 0;border-bottom:1px solid #202733;display:flex;flex-direction:column;gap:4px;font-size:12px}.error{padding:14px;border:1px solid #6a3a3a;background:#241414;color:#ffbaba;border-radius:10px}@media(max-width:700px){.hero h1{font-size:36px}.box{grid-template-columns:1fr}.box button{justify-self:end}}
+
+
+==================== CONFIG FILES =======================
+
+############################################################
+FILE: backend\requirements.txt
+############################################################
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+pydantic>=2.10,<3
+python-dotenv>=1.0,<2
+google-cloud-bigquery>=3.30,<4
+google-genai>=1.50,<2
+PyMuPDF>=1.26,<2
+pytest>=8,<9
+
+
+############################################################
+FILE: backend\Dockerfile
+############################################################
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}
+
+
+############################################################
+FILE: backend\.env.example
+############################################################
+GOOGLE_CLOUD_PROJECT=your-project-id
+GOOGLE_CLOUD_LOCATION=global
+BQ_DATASET=sec_analyst
+BQ_CHUNKS_TABLE=chunks
+BQ_FACTS_TABLE=financial_facts
+GEMINI_MODEL=gemini-2.5-flash
+EMBEDDING_MODEL=gemini-embedding-001
+EMBEDDING_DIM=3072
+TOP_K=8
+
+
+############################################################
+FILE: frontend\package.json
+############################################################
+{"name":"sec-financial-copilot","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"vite","build":"vite build","preview":"vite preview"},"dependencies":{"lucide-react":"^0.468.0","react":"^18.3.1","react-dom":"^18.3.1"},"devDependencies":{"@vitejs/plugin-react":"^4.3.4","vite":"^6.3.5"}}
+
+
+############################################################
+FILE: README.md
+############################################################
+# SEC Financial Analyst Copilot
+
+Complete reference implementation for a 12-filing SEC 10-Q RAG project.
+
+## Data
+Amazon FY2025 Q1-Q3; Alphabet FY2025 Q1-Q3; Meta FY2025 Q1-Q3; NVIDIA FY2026 Q1-Q3.
+
+Put your existing PDFs in `data/<company>/` at the repository root. Do not rename NVIDIA FY2026 files.
+
+## Pipeline
+PDF -> page/table extraction -> metadata-rich chunks -> Gemini embeddings -> BigQuery VECTOR_SEARCH -> deterministic calculator -> Gemini grounded response -> citations -> React UI.
+
+## Setup
+1. Create/activate Python 3.11 virtualenv.
+2. `pip install -r backend/requirements.txt`
+3. Copy `backend/.env.example` to `backend/.env`.
+4. Set `GOOGLE_CLOUD_PROJECT`.
+5. `gcloud auth application-default login`.
+6. Enable BigQuery and Vertex AI APIs.
+7. Replace PROJECT_ID in `backend/sql/schema.sql` and run it.
+8. From repo root run `python backend/app.py` once to ingest. It will parse PDFs, generate embeddings and load BigQuery.
+9. Create the vector index after ingestion using the commented SQL.
+10. Start API with `uvicorn backend.app:app --reload --port 8000`.
+11. In frontend: `npm install && npm run dev`.
+
+## Important limitation
+The automatic financial-fact extractor is deliberately conservative. It only accepts table rows whose labels match known metrics and stores the numeric cells as candidates. Before a production deployment, validate column semantics (current vs prior period) against table headers and expand metric aliases. Do not claim numeric correctness from an unvalidated candidate fact.
+
+## Evaluation
+Test direct lookups, YoY/QoQ calculations, cross-company comparisons, narrative questions and an out-of-corpus question. Every numeric answer must be supported by a source chunk and a deterministic calculation.
+
+
+==================== GIT STATUS =========================
+fatal: not a git repository (or any of the parent directories): .git
+
+==================== PYTHON VERSION =====================
+Python 3.12.10
+
+==================== NODE VERSION =======================
+v20.15.0
+
+==================== NPM VERSION ========================
+10.7.0
+
+==================== GCP PROJECT ========================
+bfsi-project-510910
+
+==================== BIGQUERY DATASETS ==================
+   datasetId   
+ ------------- 
+  sec_analyst  
+
+==================== BIGQUERY TABLES ====================
+         tableId          Type    Labels   Time Partitioning   Clustered Fields  
+ ----------------------- ------- -------- ------------------- ------------------ 
+  chunks                  TABLE                                                  
+  financial_facts         TABLE                                                  
+  financial_facts_final   TABLE                                                  
+  financial_facts_v2      TABLE                                                  
+
+============================================================
+END PROJECT SNAPSHOT
+============================================================

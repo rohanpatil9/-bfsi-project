@@ -1,0 +1,40 @@
+{
+  "company": "alphabet",
+  "cik": "0001652044",
+  "fiscal_year": 2025,
+  "filings": [
+    {
+      "fiscal_year": 2025,
+      "fiscal_quarter": "Q1",
+      "report_date": "2025-03-31",
+      "filing_date": "2025-04-25",
+      "form": "10-Q",
+      "accession_number": "0001652044-25-000043",
+      "primary_document": "goog-20250331.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000043/goog-20250331.htm",
+      "pdf_file": "FY2025_Q1_10Q.pdf"
+    },
+    {
+      "fiscal_year": 2025,
+      "fiscal_quarter": "Q2",
+      "report_date": "2025-06-30",
+      "filing_date": "2025-07-24",
+      "form": "10-Q",
+      "accession_number": "0001652044-25-000062",
+      "primary_document": "goog-20250630.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000062/goog-20250630.htm",
+      "pdf_file": "FY2025_Q2_10Q.pdf"
+    },
+    {
+      "fiscal_year": 2025,
+      "fiscal_quarter": "Q3",
+      "report_date": "2025-09-30",
+      "filing_date": "2025-10-30",
+      "form": "10-Q",
+      "accession_number": "0001652044-25-000091",
+      "primary_document": "goog-20250930.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000091/goog-20250930.htm",
+      "pdf_file": "FY2025_Q3_10Q.pdf"
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "company": "amazon",
+  "cik": "0001018724",
+  "fiscal_year": 2025,
+  "filings": [
+    {
+      "fiscal_year": 2025,
+      "fiscal_quarter": "Q1",
+      "report_date": "2025-03-31",
+      "filing_date": "2025-05-02",
+      "form": "10-Q",
+      "accession_number": "0001018724-25-000036",
+      "primary_document": "amzn-20250331.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1018724/000101872425000036/amzn-20250331.htm",
+      "pdf_file": "FY2025_Q1_10Q.pdf"
+    },
+    {
+      "fiscal_year": 2025,
+      "fiscal_quarter": "Q2",
+      "report_date": "2025-06-30",
+      "filing_date": "2025-08-01",
+      "form": "10-Q",
+      "accession_number": "0001018724-25-000086",
+      "primary_document": "amzn-20250630.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1018724/000101872425000086/amzn-20250630.htm",
+      "pdf_file": "FY2025_Q2_10Q.pdf"
+    },
+    {
+      "fiscal_year": 2025,
+      "fiscal_quarter": "Q3",
+      "report_date": "2025-09-30",
+      "filing_date": "2025-10-31",
+      "form": "10-Q",
+      "accession_number": "0001018724-25-000123",
+      "primary_document": "amzn-20250930.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1018724/000101872425000123/amzn-20250930.htm",
+      "pdf_file": "FY2025_Q3_10Q.pdf"
+    }
+  ]
+}

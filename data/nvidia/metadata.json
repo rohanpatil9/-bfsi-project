@@ -1,0 +1,40 @@
+{
+  "company": "nvidia",
+  "cik": "0001045810",
+  "fiscal_year": 2026,
+  "filings": [
+    {
+      "fiscal_year": 2026,
+      "fiscal_quarter": "Q1",
+      "report_date": "2025-04-27",
+      "filing_date": "2025-05-28",
+      "form": "10-Q",
+      "accession_number": "0001045810-25-000116",
+      "primary_document": "nvda-20250427.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581025000116/nvda-20250427.htm",
+      "pdf_file": "FY2026_Q1_10Q.pdf"
+    },
+    {
+      "fiscal_year": 2026,
+      "fiscal_quarter": "Q2",
+      "report_date": "2025-07-27",
+      "filing_date": "2025-08-27",
+      "form": "10-Q",
+      "accession_number": "0001045810-25-000209",
+      "primary_document": "nvda-20250727.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581025000209/nvda-20250727.htm",
+      "pdf_file": "FY2026_Q2_10Q.pdf"
+    },
+    {
+      "fiscal_year": 2026,
+      "fiscal_quarter": "Q3",
+      "report_date": "2025-10-26",
+      "filing_date": "2025-11-19",
+      "form": "10-Q",
+      "accession_number": "0001045810-25-000230",
+      "primary_document": "nvda-20251026.htm",
+      "sec_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581025000230/nvda-20251026.htm",
+      "pdf_file": "FY2026_Q3_10Q.pdf"
+    }
+  ]
+}
